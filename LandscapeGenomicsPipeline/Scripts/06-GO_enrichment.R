@@ -11,7 +11,7 @@
 # Requires Bioconductor packages topGO and GO.db:
 #   install.packages("BiocManager")
 #   BiocManager::install(c("topGO", "GO.db"))
-# Heatmap (optional): ggplot2
+# Heatmaps (optional; one PNG per ontology MF/BP/CC): ggplot2
 #   install.packages("ggplot2")
 #######################################################################
 
@@ -158,6 +158,46 @@ lgp_parse_topgo_fisher_col <- function(x) {
   suppressWarnings(as.numeric(x))
 }
 
+#' Official GO term names from GO.db (repairs topGO GenTable truncation).
+lgp_go_term_names <- function(go_ids, fallback = NULL) {
+  go_ids <- trimws(as.character(go_ids))
+  n <- length(go_ids)
+  out <- rep(NA_character_, n)
+  if (!is.null(fallback) && length(fallback) == n) {
+    out <- trimws(as.character(fallback))
+  }
+  if (!n) {
+    return(out)
+  }
+  if (!requireNamespace("AnnotationDbi", quietly = TRUE) || !requireNamespace("GO.db", quietly = TRUE)) {
+    return(out)
+  }
+  all_terms <- tryCatch(
+    AnnotationDbi::Term(GO.db::GOTERM),
+    error = function(e) NULL
+  )
+  if (is.null(all_terms) || !length(all_terms)) {
+    return(out)
+  }
+  looked <- unname(all_terms[go_ids])
+  ok <- !is.na(looked) & nzchar(looked)
+  out[ok] <- looked[ok]
+  out
+}
+
+#' Wrap labels for ggplot axes without truncating text.
+lgp_wrap_axis_label <- function(x, width = 48L) {
+  width <- as.integer(width)[1L]
+  if (!is.finite(width) || width < 20L) width <- 48L
+  x <- as.character(x)
+  vapply(x, function(s) {
+    if (length(s) != 1L || is.na(s) || !nzchar(s)) {
+      return(as.character(s))
+    }
+    paste(strwrap(s, width = width), collapse = "\n")
+  }, FUN.VALUE = character(1L), USE.NAMES = FALSE)
+}
+
 #' Run topGO Fisher test + tables for one ontology.
 lgp_run_topgo_ontology <- function(
     analysis_label,
@@ -234,6 +274,9 @@ lgp_run_topgo_ontology <- function(
   sig_terms_df <- all_res[is.finite(all_res$fisher_numeric) & all_res$fisher_numeric <= 0.05, ,
     drop = FALSE
   ]
+  if (nrow(sig_terms_df) && "Term" %in% names(sig_terms_df) && "GO.ID" %in% names(sig_terms_df)) {
+    sig_terms_df$Term <- lgp_go_term_names(sig_terms_df$GO.ID, fallback = sig_terms_df$Term)
+  }
 
   utils::write.csv(sig_terms_df, out_terms, row.names = FALSE)
 
@@ -293,13 +336,129 @@ lgp_read_go_terms_result_csv <- function(path) {
   }
   data.frame(
     GO.ID = trimws(as.character(d$GO.ID)),
-    Term = trimws(as.character(d$Term)),
+    Term = lgp_go_term_names(d$GO.ID, fallback = d$Term),
     p_value = d$p_value,
     stringsAsFactors = FALSE
   )
 }
 
-#' Heatmap of -log10(Fisher p) for enriched terms (rows) vs assay x ontology (columns).
+#' Flag GO terms plausibly related to climate adaptation in a temperate tree
+#' (e.g. Asimina triloba): water/drought, ABA, stomata, light/photosynthesis,
+#' temperature-related lipids, oxidative/abiotic stress, root foraging, etc.
+#'
+#' Uses keyword matches on Term plus a curated GO.ID allowlist (helps when
+#' topGO truncates long Term strings). Toggle with
+#' options(lgp.go_heatmap_climate_filter = FALSE) to disable.
+lgp_go_climate_adaptation_relevant <- function(go_id, term) {
+  go_id <- toupper(trimws(as.character(go_id)))
+  term <- trimws(as.character(term))
+  n <- max(length(go_id), length(term))
+  if (!n) {
+    return(logical(0))
+  }
+  go_id <- rep_len(go_id, n)
+  term <- rep_len(term, n)
+
+  # Explicit IDs kept even if Term is truncated in GenTable exports.
+  allow_ids <- c(
+    "GO:1902265", # abscisic acid homeostasis
+    "GO:0042631", # cellular response to water deprivation
+    "GO:0071462", # cellular response to water stimulus
+    "GO:0009414", # response to water deprivation
+    "GO:0009415", # response to water
+    "GO:0104004", # cellular response to environmental stimulus
+    "GO:0071496", # cellular response to external stimulus
+    "GO:0009581", # detection of external stimulus
+    "GO:0009720", # detection of hormone stimulus
+    "GO:0010375", # stomatal complex patterning
+    "GO:0010376", # stomatal complex formation
+    "GO:0010440", # stomatal lineage progression
+    "GO:2000037", # regulation of stomatal complex patterning
+    "GO:0010444", # guard mother cell differentiation
+    "GO:0009640", # photomorphogenesis
+    "GO:0009639", # response to red or far red light
+    "GO:2000030", # regulation of response to red or far red light
+    "GO:0042548", # regulation of photosynthesis, light reaction
+    "GO:0009723", # response to ethylene
+    "GO:0010540", # basipetal auxin transport
+    "GO:0009735", # response to cytokinin
+    "GO:0009884", # cytokinin receptor activity
+    "GO:0098754", # detoxification
+    "GO:0009636", # response to toxic substance
+    "GO:0046686", # response to cadmium ion
+    "GO:0009635", # response to herbicide
+    "GO:0072756", # cellular response to paraquat (ROS)
+    "GO:0071731", # response to nitric oxide
+    "GO:0071732", # cellular response to nitric oxide
+    "GO:0006749", # glutathione metabolic process
+    "GO:0043295", # glutathione binding
+    "GO:0009698", # phenylpropanoid metabolic process
+    "GO:0010023", # proanthocyanidin biosynthetic process
+    "GO:0030968", # ER unfolded protein response
+    "GO:0031990", # mRNA export in response to heat stress (often truncated)
+    "GO:0010086", # embryonic root morphogenesis
+    "GO:0080022", # primary root development
+    "GO:0008643", # carbohydrate transport
+    "GO:0034219", # carbohydrate transmembrane transport
+    "GO:0015144", # carbohydrate transmembrane transporter activity
+    "GO:1901569", # fatty acid derivative catabolic process
+    "GO:0036115", # fatty-acyl-CoA catabolic process
+    "GO:0046459", # short-chain fatty acid metabolic process
+    "GO:0005452", # solute:inorganic anion antiporter activity
+    "GO:0006855", # xenobiotic transmembrane transport
+    "GO:0042908"  # xenobiotic transport
+  )
+
+  pos <- paste0(
+    "(?i)",
+    paste(
+      c(
+        "water", "drought", "dehydrat", "desiccat",
+        "abscisic", "\\bABA\\b",
+        "osmotic", "osmolyte", "salinity", "salt stress",
+        "cold", "chill", "freez", "\\bheat\\b", "temperature", "therm[ao]",
+        "\\bstress\\b",
+        "stomatal", "\\bstomata\\b", "guard (mother )?cell",
+        "photosynth", "light reaction", "far[- ]?red", "photomorph",
+        "ethylene", "jasmon", "salicylic",
+        "antioxid", "oxidative", "reactive oxygen", "glutathione", "detox",
+        "phenylpropanoid", "flavonoid", "proanthocyanidin", "anthocyanin",
+        "cuticle", "\\bwax\\b", "suberin",
+        "environmental stim", "external stimulus", "\\babiotic\\b",
+        "cadmium", "toxic substance", "xenobiotic", "heavy metal", "paraquat", "herbicide",
+        "unfolded protein", "heat shock",
+        "nitric oxide",
+        "basipetal auxin",
+        "root morphogenesis", "primary root", "lateral root",
+        "carbohydrate transport", "carbohydrate transmembrane",
+        "fatty acid", "fatty-acyl",
+        "anion antiporter"
+      ),
+      collapse = "|"
+    )
+  )
+  neg <- paste0(
+    "(?i)",
+    paste(
+      c(
+        "cartilage", "muscle cell", "limbic", "orbitofrontal",
+        "bronchodilator", "cytokine production", "heparin",
+        "glycosaminoglycan", "connective tissue",
+        "\\bX-ray\\b", "bleomycin", "vitamin B1", "monosaccharide"
+      ),
+      collapse = "|"
+    )
+  )
+
+  hit_id <- go_id %in% allow_ids
+  hit_kw <- grepl(pos, term, perl = TRUE)
+  hit_neg <- grepl(neg, term, perl = TRUE)
+  (hit_id | hit_kw) & !hit_neg
+}
+
+#' Heatmaps of -log10(Fisher p): one plot per ontology (MF / BP / CC),
+#' with pRDA and LFMM as columns within each plot.
+#' Color scale is shared across ontologies so panels are comparable.
 lgp_plot_go_enrichment_heatmap <- function(
     results_dir,
     go_plot_dir,
@@ -328,146 +487,422 @@ lgp_plot_go_enrichment_heatmap <- function(
   }
   nlp_cap_use <- if (!is.null(nlp_cap)) nlp_cap else cap
 
-  long_lst <- list()
-  facet_order <- character(0)
-
   onts <- toupper(trimws(unique(ontologies[ontologies %in% c("MF", "BP", "CC")])))
+  ont_labels <- c(
+    MF = "Molecular Function (MF)",
+    BP = "Biological Process (BP)",
+    CC = "Cellular Component (CC)"
+  )
 
-  for (a in analyses) {
-    safe_lab <- gsub("[^A-Za-z0-9._-]+", "_", a)
-    for (o in onts) {
+  assay_order <- unique(as.character(analyses))
+  panels <- list()
+  obs_all <- numeric(0)
+  climate_filter <- {
+    opt <- getOption("lgp.go_heatmap_climate_filter", TRUE)
+    if (is.logical(opt)) isTRUE(opt[1L]) else !identical(tolower(trimws(as.character(opt[1L]))), "false")
+  }
+  kept_terms_rows <- list()
+
+  for (o in onts) {
+    long_lst <- list()
+    for (a in assay_order) {
+      safe_lab <- gsub("[^A-Za-z0-9._-]+", "_", a)
       path <- file.path(results_dir, paste0(safe_lab, "_", o, "_go_terms.csv"))
       blk <- lgp_read_go_terms_result_csv(path)
       if (is.null(blk)) next
-      facet <- paste(a, o, sep = "_")
-      facet_order <- unique(c(facet_order, facet))
-      blk$facet <- facet
+      blk$facet <- a
       long_lst[[length(long_lst) + 1L]] <- blk
     }
+
+    if (!length(long_lst)) {
+      message("[GO] No significant ", o, " term tables found for heatmap.")
+      next
+    }
+
+    long <- do.call(rbind, long_lst)
+    rownames(long) <- NULL
+
+    climate_filter_local <- climate_filter
+    if (isTRUE(climate_filter_local)) {
+      keep_cli <- lgp_go_climate_adaptation_relevant(long$GO.ID, long$Term)
+      n_before <- length(unique(long$GO.ID))
+      long <- long[keep_cli, , drop = FALSE]
+      message(
+        "[GO] Climate-adaptation filter (", o, "): kept ",
+        length(unique(long$GO.ID)), " / ", n_before, " enriched term(s)."
+      )
+      if (!nrow(long)) {
+        message("[GO] No climate-relevant ", o, " terms after filter; skipping heatmap.")
+        next
+      }
+    }
+
+    facet_order <- assay_order[assay_order %in% unique(long$facet)]
+    uniq_go <- unique(long$GO.ID)
+    mat <- matrix(NA_real_,
+      nrow = length(uniq_go),
+      ncol = length(facet_order),
+      dimnames = list(uniq_go, facet_order))
+
+    long$nlp_uncapped <- -log10(pmax(long$p_value, .Machine$double.xmin))
+    long$nlp <- pmin(long$nlp_uncapped, nlp_cap_use)
+
+    for (k in seq_len(nrow(long))) {
+      gi <- long$GO.ID[k]
+      fj <- long$facet[k]
+      v <- long$nlp[k]
+      ov <- mat[gi, fj]
+      if (!is.finite(ov)) {
+        mat[gi, fj] <- v
+      } else if (is.finite(v)) {
+        mat[gi, fj] <- max(ov, v, na.rm = TRUE)
+      }
+    }
+
+    dup_term <- aggregate(Term ~ GO.ID, data = long, function(x) as.character(utils::head(x, 1)))
+    colnames(dup_term) <- c("GO.ID", "Term")
+
+    sc <- apply(mat, 1L, function(z) suppressWarnings(max(z, na.rm = TRUE)))
+    sc[!is.finite(sc)] <- 0
+
+    nk <- names(sort.int(sc, decreasing = TRUE))[seq_len(min(max_terms_use, length(sc)))]
+    nk <- nk[sc[nk] > 0 & is.finite(sc[nk])]
+    if (!length(nk)) {
+      message("[GO] Heatmap skipped for ", o, ": no terms with finite enrichment scores.")
+      next
+    }
+
+    nk <- nk[seq_len(min(length(nk), max_terms_use))]
+    mat_sub <- mat[nk, , drop = FALSE]
+
+    nr <- nrow(mat_sub)
+    nc <- ncol(mat_sub)
+    plot_df <- data.frame(
+      GO.ID = rep(rownames(mat_sub), times = nc),
+      facet = rep(colnames(mat_sub), each = nr),
+      nlp = as.vector(mat_sub),
+      stringsAsFactors = FALSE
+    )
+    plot_df <- merge(plot_df, dup_term, by = "GO.ID", sort = FALSE, all.x = TRUE)
+
+    go_levels <- rownames(mat_sub)[order(apply(mat_sub, 1L, max, na.rm = TRUE))]
+    plot_df$GO.fac <- factor(plot_df$GO.ID, levels = go_levels)
+
+    id2lbl <- dup_term[!duplicated(dup_term$GO.ID), , drop = FALSE]
+    id2lbl$Term <- lgp_go_term_names(id2lbl$GO.ID, fallback = id2lbl$Term)
+
+    # Full names for CSVs / inventory; wrapped copy only for axis display.
+    tn_full <- trimws(as.character(id2lbl$Term))
+    names(tn_full) <- trimws(as.character(id2lbl$GO.ID))
+    wrap_w <- suppressWarnings(as.integer(getOption("lgp.go_heatmap_label_wrap", 48L))[1L])
+    if (!is.finite(wrap_w) || wrap_w < 20L) wrap_w <- 48L
+    tn_wrap <- lgp_wrap_axis_label(tn_full, width = wrap_w)
+    names(tn_wrap) <- names(tn_full)
+
+    plot_df$facet <- factor(plot_df$facet, levels = facet_order)
+    lvl <- levels(plot_df$GO.fac)
+
+    ylab_txt <- vapply(lvl, function(g) {
+      lab <- suppressWarnings(trimws(as.character(tn_full[g][1])))
+      if (length(lab) != 1L || is.na(lab) || identical(lab, "NA") || !nzchar(lab)) {
+        paste0(g, " (no Term)")
+      } else {
+        lab
+      }
+    }, FUN.VALUE = character(1L))
+    ylab_map <- structure(as.character(ylab_txt), names = as.character(lvl))
+
+    ylab_display <- vapply(lvl, function(g) {
+      lab <- suppressWarnings(as.character(tn_wrap[g][1]))
+      if (length(lab) != 1L || is.na(lab) || identical(lab, "NA") || !nzchar(lab)) {
+        ylab_map[[g]]
+      } else {
+        lab
+      }
+    }, FUN.VALUE = character(1L))
+    ylab_display <- structure(as.character(ylab_display), names = as.character(lvl))
+
+    heat_png <- file.path(go_plot_dir, paste0("go_enrichment_heatmap_", o, "_minusLog10_Fisher.png"))
+    heat_csv <- file.path(go_plot_dir, paste0("go_enrichment_heatmap_", o, "_matrix.csv"))
+
+    obs <- as.numeric(mat_sub)
+    obs <- obs[is.finite(obs)]
+    obs_all <- c(obs_all, obs)
+
+    kept_terms_rows[[length(kept_terms_rows) + 1L]] <- data.frame(
+      ontology = o,
+      GO.ID = rownames(mat_sub),
+      Term = unname(ylab_map[rownames(mat_sub)]),
+      stringsAsFactors = FALSE
+    )
+
+    panels[[o]] <- list(
+      ontology = o,
+      mat_sub = mat_sub,
+      plot_df = plot_df,
+      ylab_map = ylab_map,
+      ylab_display = ylab_display,
+      lvl = lvl,
+      nr = nr,
+      nc = nc,
+      heat_png = heat_png,
+      heat_csv = heat_csv
+    )
   }
 
-  if (!length(long_lst)) {
+  if (!length(panels)) {
     message("[GO] No significant GO term tables found for heatmap (expected *_*_go_terms.csv).")
     return(invisible(NULL))
   }
 
-  long <- do.call(rbind, long_lst)
-  rownames(long) <- NULL
+  if (length(kept_terms_rows)) {
+    kept_df <- do.call(rbind, kept_terms_rows)
+    rownames(kept_df) <- NULL
+    kept_csv <- file.path(
+      go_plot_dir,
+      if (isTRUE(climate_filter)) {
+        "go_climate_adaptation_terms_in_heatmaps.csv"
+      } else {
+        "go_terms_in_heatmaps.csv"
+      }
+    )
+    utils::write.csv(kept_df, kept_csv, row.names = FALSE)
+    message("[GO] Wrote term inventory -> ", basename(kept_csv), " (", nrow(kept_df), " row(s)).")
+  }
 
-  uniq_go <- unique(long$GO.ID)
-  ncol_m <- length(facet_order)
-  mat <- matrix(NA_real_,
-    nrow = length(uniq_go),
-    ncol = ncol_m,
-    dimnames = list(uniq_go, facet_order))
-
-  long$nlp_uncapped <- -log10(pmax(long$p_value, .Machine$double.xmin))
-  long$nlp <- pmin(long$nlp_uncapped, nlp_cap_use)
-
-  for (k in seq_len(nrow(long))) {
-    gi <- long$GO.ID[k]
-    fj <- long$facet[k]
-    v <- long$nlp[k]
-    ov <- mat[gi, fj]
-    if (!is.finite(ov)) {
-      mat[gi, fj] <- v
-    } else if (is.finite(v)) {
-      mat[gi, fj] <- max(ov, v, na.rm = TRUE)
+  # Shared fill scale across MF/BP/CC so panels are visually comparable.
+  scale_mode <- tolower(trimws(as.character(
+    getOption("lgp.go_heatmap_scale_mode", "data")[1L]
+  )))
+  if (identical(scale_mode, "fixed") || !length(obs_all)) {
+    fill_lo <- 0
+    fill_hi <- nlp_cap_use
+  } else {
+    fill_lo <- min(obs_all)
+    fill_hi <- max(obs_all)
+    pad <- max(0.05, (fill_hi - fill_lo) * 0.08)
+    fill_lo <- max(0, fill_lo - pad)
+    fill_hi <- min(nlp_cap_use, fill_hi + pad)
+    if (!is.finite(fill_hi) || fill_hi <= fill_lo) {
+      fill_lo <- 0
+      fill_hi <- nlp_cap_use
     }
   }
-
-  dup_term <- aggregate(Term ~ GO.ID, data = long, function(x) as.character(utils::head(x, 1)))
-  colnames(dup_term) <- c("GO.ID", "Term")
-
-  sc <- apply(mat, 1L, function(z) suppressWarnings(max(z, na.rm = TRUE)))
-  sc[!is.finite(sc)] <- 0
-
-  nk <- names(sort.int(sc, decreasing = TRUE))[seq_len(min(max_terms_use, length(sc)))]
-  nk <- nk[sc[nk] > 0 & is.finite(sc[nk])]
-  if (!length(nk)) {
-    message("[GO] Heatmap skipped: no terms with finite enrichment scores.")
-    return(invisible(NULL))
+  fill_brks <- pretty(c(fill_lo, fill_hi), n = 5)
+  fill_brks <- fill_brks[fill_brks >= fill_lo - 1e-9 & fill_brks <= fill_hi + 1e-9]
+  if (!length(fill_brks)) {
+    fill_brks <- c(fill_lo, fill_hi)
   }
 
-  nk <- nk[seq_len(min(length(nk), max_terms_use))]
-  mat_sub <- mat[nk, , drop = FALSE]
-
-  nr <- nrow(mat_sub)
-  nc <- ncol(mat_sub)
-  plot_df <- data.frame(
-    GO.ID = rep(rownames(mat_sub), times = nc),
-    facet = rep(colnames(mat_sub), each = nr),
-    nlp = as.vector(mat_sub),
-    stringsAsFactors = FALSE
+  n_cols <- 6L
+  pal_cols <- c(
+    "#f7f4ef",
+    "#ffe08a",
+    "#ff9f4a",
+    "#ef5d5d",
+    "#b83280",
+    "#3d1a5c"
   )
-  plot_df <- merge(plot_df, dup_term, by = "GO.ID", sort = FALSE, all.x = TRUE)
+  if (length(obs_all) >= 2L && fill_hi > fill_lo) {
+    q_stops <- as.numeric(stats::quantile(
+      obs_all,
+      probs = seq(0, 1, length.out = n_cols),
+      names = FALSE,
+      type = 7
+    ))
+    fill_vals <- (q_stops - fill_lo) / (fill_hi - fill_lo)
+    fill_vals <- pmax(0, pmin(1, fill_vals))
+    for (i in seq_along(fill_vals)[-1L]) {
+      if (fill_vals[i] <= fill_vals[i - 1L]) {
+        fill_vals[i] <- min(1, fill_vals[i - 1L] + 1e-4)
+      }
+    }
+    fill_vals[1L] <- 0
+    fill_vals[length(fill_vals)] <- 1
+  } else {
+    fill_vals <- seq(0, 1, length.out = n_cols)
+  }
 
-  go_levels <- rownames(mat_sub)[order(apply(mat_sub, 1L, max, na.rm = TRUE))]
-  plot_df$GO.fac <- factor(plot_df$GO.ID, levels = go_levels)
-
-  id2lbl <- dup_term[!duplicated(dup_term$GO.ID), , drop = FALSE]
-
-  tn <- trimws(as.character(id2lbl$Term))
-  id_lab <- ifelse(
-    nchar(tn) > 58L,
-    paste0(trimws(substr(tn, 1L, 55L)), "..."),
-    tn
+  message(
+    "[GO] Shared heatmap fill scale across ",
+    paste(names(panels), collapse = "/"),
+    ": ",
+    format(signif(fill_lo, 3)),
+    "–",
+    format(signif(fill_hi, 3))
   )
-  names(id_lab) <- trimws(as.character(id2lbl$GO.ID))
 
-  plot_df$facet <- factor(plot_df$facet, levels = facet_order)
-  lvl <- levels(plot_df$GO.fac)
+  # Always refresh per-ontology matrices; PNG is a stacked BP (top) + MF (bottom) figure.
+  for (panel in panels) {
+    utils::write.csv(
+      cbind(panel$mat_sub, Term = panel$ylab_map[row.names(panel$mat_sub)]),
+      panel$heat_csv,
+      row.names = TRUE
+    )
+  }
 
-  ylab_txt <- vapply(lvl, function(g) {
-    lab <- suppressWarnings(trimws(as.character(id_lab[g][1])))
-    if (length(lab) != 1L || is.na(lab) || identical(lab, "NA") || !nzchar(lab)) {
-      paste0(g, " (no Term)")
+  stack_order <- c("BP", "MF")
+  stack_order <- stack_order[stack_order %in% names(panels)]
+  # Any remaining ontologies (e.g. CC) get their own single-panel PNG.
+  other_onts <- setdiff(names(panels), stack_order)
+
+  combo_png <- file.path(
+    go_plot_dir,
+    if (length(stack_order) >= 2L) {
+      paste0("go_enrichment_heatmap_", paste(stack_order, collapse = "_"), "_minusLog10_Fisher.png")
+    } else if (length(stack_order) == 1L) {
+      panels[[stack_order]]$heat_png
     } else {
-      lab
+      NA_character_
     }
-  }, FUN.VALUE = character(1L))
-  ylab_map <- structure(as.character(ylab_txt), names = as.character(lvl))
-
-  heat_png <- file.path(go_plot_dir, "go_enrichment_heatmap_minusLog10_Fisher.png")
-  heat_csv <- file.path(go_plot_dir, "go_enrichment_heatmap_matrix.csv")
-
-  deps_heat <- c(
-    Sys.glob(file.path(results_dir, "*_*_go_terms.csv"))
   )
+  other_pngs <- vapply(other_onts, function(o) panels[[o]]$heat_png, character(1L))
+  out_pngs <- c(if (is.character(combo_png) && !is.na(combo_png)) combo_png, other_pngs)
 
-  util_write <- TRUE
-  if (length(deps_heat) && isTRUE(file.exists(heat_png)) && !lgp_should_rerun_external(heat_png, deps_heat)) {
-    message("[GO] Heatmap PNG up to date: ", basename(heat_png))
-    util_write <- FALSE
+  deps_heat <- Sys.glob(file.path(results_dir, "*_*_go_terms.csv"))
+  need_write <- !length(deps_heat) || !length(out_pngs) || any(vapply(out_pngs, function(p) {
+    !isTRUE(file.exists(p)) || isTRUE(lgp_should_rerun_external(p, deps_heat))
+  }, logical(1L)))
+
+  written <- character(0)
+  if (!need_write) {
+    for (pn in out_pngs) {
+      message("[GO] Heatmap PNG up to date: ", basename(pn))
+      written <- c(written, pn)
+    }
+    return(invisible(written))
   }
 
-  if (util_write) {
-    p <- ggplot2::ggplot(plot_df, ggplot2::aes(
+  lgp_draw_go_heatmap_stacked <- function(plot_df, y_levels, y_labels, title, subtitle) {
+    ggplot2::ggplot(plot_df, ggplot2::aes(
       x = .data[["facet"]],
-      y = .data[["GO.fac"]],
+      y = .data[["ykey"]],
       fill = .data[["nlp"]]
     )) +
-      ggplot2::geom_tile(color = "#e8e8e8") +
-      ggplot2::scale_fill_gradient(
-        limits = c(0, nlp_cap_use),
-        na.value = "#f7f7f7",
-        low = "#fffff0",
-        high = "#084594",
-        name = "-log10 Fisher P\n(capped fill)"
+      ggplot2::geom_tile(color = "#f4f1ec", linewidth = 0.25) +
+      ggplot2::scale_fill_gradientn(
+        colours = pal_cols,
+        values = fill_vals,
+        limits = c(fill_lo, fill_hi),
+        breaks = fill_brks,
+        na.value = "#f0eee9",
+        name = "-log10 Fisher P"
       ) +
-      ggplot2::scale_y_discrete(
-        breaks = lvl,
-        labels = ylab_map[lvl],
+      ggplot2::scale_y_discrete(breaks = y_levels, labels = y_labels) +
+      ggplot2::facet_grid(ontology ~ ., scales = "free_y", space = "free_y", switch = "y") +
+      ggplot2::labs(title = title, subtitle = subtitle, x = NULL, y = NULL) +
+      ggplot2::theme_bw(base_size = 11) +
+      ggplot2::theme(
+        legend.position = "right",
+        plot.title = ggplot2::element_text(face = "bold"),
+        plot.subtitle = ggplot2::element_text(size = 9),
+        axis.text.x = ggplot2::element_text(angle = 45, hjust = 1, vjust = 1),
+        axis.text.y = ggplot2::element_text(size = 7, lineheight = 0.95),
+        plot.margin = ggplot2::margin(8, 12, 8, 8),
+        strip.placement = "outside",
+        strip.text.y.left = ggplot2::element_text(angle = 90, face = "bold", size = 13),
+        strip.background.y = ggplot2::element_rect(fill = "#efeae3", colour = NA),
+        panel.spacing.y = grid::unit(0.6, "lines")
+      )
+  }
+
+  if (length(stack_order)) {
+    stack_rows <- lapply(stack_order, function(o) {
+      pn <- panels[[o]]
+      df <- pn$plot_df
+      df$ontology <- o
+      df$ykey <- paste(o, as.character(df$GO.ID), sep = "||")
+      df
+    })
+    stack_df <- do.call(rbind, stack_rows)
+    rownames(stack_df) <- NULL
+    stack_df$ontology <- factor(stack_df$ontology, levels = stack_order)
+
+    y_levels <- unlist(lapply(stack_order, function(o) {
+      paste(o, panels[[o]]$lvl, sep = "||")
+    }), use.names = FALSE)
+    y_labels <- unlist(lapply(stack_order, function(o) {
+      pn <- panels[[o]]
+      lab <- pn$ylab_display
+      if (is.null(lab)) lab <- pn$ylab_map
+      unname(lab[pn$lvl])
+    }), use.names = FALSE)
+    names(y_labels) <- y_levels
+    stack_df$ykey <- factor(stack_df$ykey, levels = y_levels)
+
+    n_terms <- vapply(stack_order, function(o) panels[[o]]$nr, integer(1L))
+    sub_txt <- paste0(
+      if (length(stack_order) >= 2L) {
+        "BP (top) and MF (bottom); "
+      } else {
+        paste0(stack_order[[1L]], "; ")
+      },
+      if (isTRUE(climate_filter)) {
+        "climate-adaptation filter; "
+      } else {
+        ""
+      },
+      sprintf("shared scale %.2f–%.2f; columns: pRDA vs LFMM.", fill_lo, fill_hi)
+    )
+
+    p_stack <- lgp_draw_go_heatmap_stacked(
+      stack_df,
+      y_levels,
+      y_labels,
+      title = "Enriched GO terms (Fisher)",
+      subtitle = sub_txt
+    )
+
+    n_label_lines <- sum(vapply(y_labels, function(s) {
+      length(strsplit(as.character(s), "\n", fixed = TRUE)[[1L]])
+    }, integer(1L)))
+    h_in <- min(72, max(6, n_label_lines * 0.22 + 2.2))
+    nc <- max(vapply(stack_order, function(o) panels[[o]]$nc, integer(1L)))
+    w_in <- max(8.5, min(12, 6.8 + nc * 1.2))
+    ggplot2::ggsave(combo_png, p_stack, width = w_in, height = h_in, dpi = 220, limitsize = FALSE, bg = "white")
+    message("[GO] Wrote stacked GO heatmap -> ", basename(combo_png),
+            " [", paste(stack_order, collapse = "+"), "]")
+    written <- c(written, combo_png)
+
+    # Remove obsolete single-ontology PNGs for stacked panels.
+    for (o in stack_order) {
+      old_png <- panels[[o]]$heat_png
+      if (isTRUE(file.exists(old_png)) && !identical(normalizePath(old_png), normalizePath(combo_png))) {
+        unlink(old_png)
+      }
+    }
+  }
+
+  for (o in other_onts) {
+    panel <- panels[[o]]
+    ont_title <- if (!is.na(ont_labels[o])) ont_labels[o] else o
+    df <- panel$plot_df
+    df$ykey <- factor(as.character(df$GO.ID), levels = panel$lvl)
+    y_labels <- panel$ylab_display
+    if (is.null(y_labels)) y_labels <- panel$ylab_map
+    y_labels <- unname(y_labels[panel$lvl])
+    names(y_labels) <- panel$lvl
+
+    p <- ggplot2::ggplot(df, ggplot2::aes(
+      x = .data[["facet"]],
+      y = .data[["ykey"]],
+      fill = .data[["nlp"]]
+    )) +
+      ggplot2::geom_tile(color = "#f4f1ec", linewidth = 0.25) +
+      ggplot2::scale_fill_gradientn(
+        colours = pal_cols,
+        values = fill_vals,
+        limits = c(fill_lo, fill_hi),
+        breaks = fill_brks,
+        na.value = "#f0eee9",
+        name = "-log10 Fisher P"
       ) +
+      ggplot2::scale_y_discrete(breaks = panel$lvl, labels = y_labels) +
       ggplot2::labs(
-        title = "Enriched GO terms (Fisher)",
+        title = paste0("Enriched GO terms — ", ont_title),
         subtitle = sprintf(
-          paste0(
-            "Top %s terms by strongest column; fill = min(-log10(p), %s) per assay_ontology;",
-            "\ncolumns: pRDA/LFMM x MF/BP/CC (only assays with enrichment output)."
-          ),
-          nrow(mat_sub),
-          format(signif(nlp_cap_use, 3))
+          "Shared color scale (%.2f–%.2f). Columns: pRDA vs LFMM.",
+          fill_lo, fill_hi
         ),
         x = NULL,
         y = "GO term"
@@ -477,16 +912,20 @@ lgp_plot_go_enrichment_heatmap <- function(
         legend.position = "right",
         plot.title = ggplot2::element_text(face = "bold"),
         axis.text.x = ggplot2::element_text(angle = 45, hjust = 1, vjust = 1),
-        axis.text.y = ggplot2::element_text(size = 7)
+        axis.text.y = ggplot2::element_text(size = 7, lineheight = 0.95)
       )
 
-    h_in <- min(52, max(5, nr * 0.18))
-    ggplot2::ggsave(heat_png, p, width = 9, height = h_in, dpi = 220, limitsize = FALSE, bg = "white")
-    utils::write.csv(cbind(mat_sub, Term = ylab_map[row.names(mat_sub)]), heat_csv, row.names = TRUE)
-    message("[GO] Wrote GO heatmap -> ", basename(heat_png))
+    n_label_lines <- sum(vapply(y_labels, function(s) {
+      length(strsplit(as.character(s), "\n", fixed = TRUE)[[1L]])
+    }, integer(1L)))
+    h_in <- min(60, max(5, n_label_lines * 0.22 + 1.8))
+    w_in <- max(8, min(12, 6.5 + panel$nc * 1.2))
+    ggplot2::ggsave(panel$heat_png, p, width = w_in, height = h_in, dpi = 220, limitsize = FALSE, bg = "white")
+    message("[GO] Wrote GO heatmap (", o, ") -> ", basename(panel$heat_png))
+    written <- c(written, panel$heat_png)
   }
 
-  invisible(heat_png)
+  invisible(written)
 }
 
 # ---- Load annotation backbone -------------------------------------------------
