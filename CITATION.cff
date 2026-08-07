@@ -1,0 +1,18 @@
+# This CITATION.cff file was generated with cffinit.
+# Visit https://bit.ly/cffinit to generate yours today!
+
+cff-version: 1.2.0
+title: Asimina triloba adaptation
+message: >-
+  If you use this software, please cite it using the
+  metadata from this file.
+type: software
+authors:
+  - given-names: Susan
+    name-particle: R
+    family-names: Strickler
+    email: sstrickler@chicagobotanic.org
+    orcid: 'https://orcid.org/0000-0002-0121-0048'
+  - given-names: Victoria
+    family-names: Martinez Mercado
+    email: victoriamartinezmercado2029@u.northwestern.edu
