@@ -1,0 +1,1527 @@
+---
+title: "ColdToleranceTry"
+author: "Vic"
+date: "2026-08-27"
+output: html_document
+---
+
+Cold tolerance analysis for CAFE5
+Supports BOTH analyses:
+    Rscript 8a.coldTolerance.R default
+    Rscript 8a.coldTolerance.R zeroRoot
+
+Results are written to:
+    results/default/cold_tolerance/
+    results/zeroRoot/cold_tolerance/
+
+```{r}
+suppressPackageStartupMessages({
+  library(topGO)
+  library(GO.db)
+  library(readr)
+  library(dplyr)
+  library(tidyr)
+  library(stringr)
+  library(ggplot2)
+})
+
+```
+# 1. Analysis Mode and Output Directories
+
+This section configures which CAFE5 analysis is used as input for the cold-tolerance gene-family analysis and defines the corresponding output directory.
+
+Two CAFE5 analyses are available:
+
+- **`default`** — standard CAFE5 analysis.
+- **`zeroRoot`** — CAFE5 analysis allowing gene families with zero copies at the root.
+
+The selected analysis determines both the CAFE5 input directory and the location where downstream cold-tolerance results are saved. For the purpose of this analysis, I am using zeroRoot, but this can be changed to default if needed. 
+
+```{r}
+
+args <- commandArgs(trailingOnly = TRUE)
+
+# For command-line execution:
+# analysis <- if (length(args) == 0) "default" else args[1]
+
+analysis <- "zeroRoot"
+
+if (!(analysis %in% c("default", "zeroRoot"))) {
+  stop("Use: Rscript 8a.coldTolerance.R default|zeroRoot")
+}
+
+cafe_dir <- switch(
+  analysis,
+  default  = "cafe_default",
+  zeroRoot = "cafe_zeroRoot"
+)
+
+results_dir <- file.path(
+  "results",
+  analysis,
+  "cold_tolerance"
+)
+
+dir.create(
+  results_dir,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+```
+# 2. Locate and Load Input Files
+
+This section identifies and validates the input files required for the cold-tolerance gene-family analysis. The analysis integrates observed orthogroup gene counts from OrthoFinder, inferred gene-family changes and branch-specific probabilities from CAFE5, and Gene Ontology (GO) annotations.
+
+###OrthoFinder gene-family counts
+
+The OrthoFinder `Orthogroups.GeneCount.tsv` file contains the observed number of genes assigned to each orthogroup for each species. Because multiple OrthoFinder result directories may be present, the most recently modified `Results_*` directory is identified automatically and used for the analysis.
+
+### CAFE5 gene-family changes
+
+The `Gamma_change.tab` file contains the inferred change in gene-family size along each terminal and internal branch of the phylogeny. Positive values represent gene-family expansions, negative values represent contractions, and zero indicates no inferred change along that branch.
+
+### CAFE5 family-level results
+
+The `Gamma_family_results.txt` file contains family-level statistical results from CAFE5. These results are retained to identify gene families showing evidence of rapid evolution across the phylogeny. Because the family-level test does not identify the particular branch responsible for the signal, these results are interpreted separately from the branch-specific probabilities.
+
+
+### CAFE5 branch probabilities
+
+The `Gamma_branch_probabilities.tab` file contains branch-specific probabilities associated with the inferred gene-family changes. A probability threshold of **0.05** is used to identify rapidly changing gene families on branches of interest.
+
+### Gene Ontology annotations
+
+The `all_go_unique_clean.tsv` file provides GO annotations associated with the orthogroups and is used to connect gene-family changes with functional categories for downstream analyses.
+```{r}
+# Identify newest OrthoFinder Results_* directory
+results_dirs <- list.dirs(
+  "orthofinder",
+  recursive = FALSE,
+  full.names = TRUE
+)
+
+results_dirs <- results_dirs[
+  grepl("Results_", basename(results_dirs))
+]
+
+results_dirs <- results_dirs[
+  order(
+    file.info(results_dirs)$mtime,
+    decreasing = TRUE
+  )
+]
+
+
+# OrthoFinder gene counts
+gene_count_file <- file.path(
+  results_dirs[1],
+  "Orthogroups",
+  "Orthogroups.GeneCount.tsv"
+)
+# OrthoFinder orthogroup gene assignments
+orthogroups_file <- file.path(
+  results_dirs[1],
+  "Orthogroups",
+  "Orthogroups.tsv"
+)
+
+
+# CAFE5 results
+gamma_change_file <- file.path(
+  cafe_dir,
+  "Gamma_change.tab"
+)
+
+gamma_family_file <- file.path(
+  cafe_dir,
+  "Gamma_family_results.txt"
+)
+
+gamma_branch_prob_file <- file.path(
+  cafe_dir,
+  "Gamma_branch_probabilities.tab"
+)
+
+family_pvalue_threshold <- 0.05
+branch_probability_threshold <- 0.05
+
+
+# GO annotations
+go_map_file <- "all_go_unique_clean.tsv"
+
+
+# Report exact input files used
+cat(
+  "\nInput files:\n",
+  "OrthoFinder gene counts:  ", gene_count_file, "\n",
+  "OrthoFinder orthogroups:  ", orthogroups_file, "\n",
+  "CAFE5 changes:            ", gamma_change_file, "\n",
+  "CAFE5 family results:     ", gamma_family_file, "\n",
+  "CAFE5 branch probs:       ", gamma_branch_prob_file, "\n",
+  "GO annotations:           ", go_map_file, "\n\n",
+  sep = ""
+)
+# Read OrthoFinder observed gene counts
+gene_counts <- read_tsv(
+  gene_count_file,
+  show_col_types = FALSE
+)
+# Read OrthoFinder orthogroup gene assignments
+orthogroups <- read_tsv(
+  orthogroups_file,
+  show_col_types = FALSE
+)
+
+# Read CAFE5 inferred branch changes
+cafe_changes <- read_tsv(
+  gamma_change_file,
+  show_col_types = FALSE
+)
+
+# Read CAFE5 family-level results
+cafe_family_results <- read_tsv(
+  gamma_family_file,
+  show_col_types = FALSE
+)
+
+# Read CAFE5 branch-specific probabilities
+cafe_branch_probabilities <- read_tsv(
+  gamma_branch_prob_file,
+  show_col_types = FALSE
+)
+
+
+# Read GO annotations
+go_annotations_raw <- read_tsv(
+  go_map_file,
+  col_names = c(
+    "Orthogroup",
+    "GO_ID"
+  ),
+  show_col_types = FALSE
+)
+
+# Remove .tsv suffix from orthogroup names, if present
+go_annotations_raw <- go_annotations_raw %>%
+  mutate(
+    Orthogroup = sub("\\.tsv$", "", Orthogroup)
+  )
+
+#head(go_annotations_raw)
+```
+
+# 3. Define Species Used in the Analysis
+
+The cold-tolerance analysis focuses on *Asimina triloba* (pawpaw), which is treated as the focal species. The remaining five species includes *Magnolia kwangsiensis*, *Lindera megaphylla*, *Persea americana*, *Annona cherimola*, and *Annona montana*. 
+
+```{r}
+# Focal species
+focal_species <- "Asimina_triloba"
+
+
+# Comparison species
+comparison_species <- c(
+  "Magnolia_kwangsiensis",
+  "Lindera_megaphylla",
+  "Persea_americana",
+  "Annona_cherimola",
+  "Annona_montana"
+)
+
+
+# Complete species set
+all_species <- c(
+  focal_species,
+  comparison_species
+)
+```
+# 4. Define Helper Functions
+
+The `clean_cafe_names()` function standardizes branch names imported from CAFE5. Terminal branches are converted from names containing CAFE5 node identifiers (for example, `Asimina_triloba<3>`) to species names (`Asimina_triloba`), while internal branches represented only by node numbers (for example, `<10>`) are renamed using the format `Node_10`.
+
+The `run_topGO()` function performs Gene Ontology enrichment analysis for expanded gene families using the Biological Process (BP) ontology. Orthogroups in the specified background are classified according to whether they belong to the expanded gene-family set, and orthogroup-to-GO associations are supplied to topGO. Enrichment is tested using Fisher's exact test with the `weight01` algorithm, and resulting P-values are adjusted for multiple testing using the Benjamini-Hochberg false discovery rate (FDR) procedure.
+```{r}
+# Clean CAFE5 branch names
+clean_cafe_names <- function(x) {
+  
+  dplyr::case_when(
+    stringr::str_detect(x, "^<[0-9]+>$") ~
+      paste0(
+        "Node_",
+        stringr::str_extract(x, "[0-9]+")
+      ),
+    
+    TRUE ~
+      stringr::str_remove(x, "<[0-9]+>$")
+  )
+}
+
+
+# Run GO enrichment with topGO
+run_topGO <- function(
+  background_df,
+  expanded_df,
+  go_annotations
+) {
+  
+  geneList <- as.integer(
+    background_df$Orthogroup %in%
+      expanded_df$Orthogroup
+  )
+  
+  names(geneList) <- background_df$Orthogroup
+  
+  geneList <- factor(geneList)
+  
+  geneID2GO <- split(
+    go_annotations$GO_ID,
+    go_annotations$Orthogroup
+  )
+  
+  GOdata <- new(
+    "topGOdata",
+    ontology = "BP",
+    allGenes = geneList,
+    annot = annFUN.gene2GO,
+    gene2GO = geneID2GO,
+    nodeSize = 5
+  )
+  
+  resultFisher <- runTest(
+    GOdata,
+    algorithm = "weight01",
+    statistic = "fisher"
+  )
+  
+  results <- GenTable(
+    GOdata,
+    Fisher = resultFisher,
+    orderBy = "Fisher",
+    topNodes = 50
+  )
+  
+  results$FDR <- p.adjust(
+    results$Fisher,
+    method = "BH"
+  )
+  
+  results <- results %>%
+    arrange(FDR)
+  
+  return(results)
+}
+```
+
+# 5. Data Wrangling and Preparation
+The CAFE5 gene-family change data, branch-specific probabilities, and GO annotations are standardized and combined. 
+
+## 5.1 CAFE5 Gene-Family Changes
+The `FamilyID` column is renamed `Orthogroup` to maintain consistent orthogroup identifiers across datasets. CAFE5 branch labels are standardized using the `clean_cafe_names()` helper function, and unnamed columns are removed.
+
+Columns corresponding to terminal species are given the suffix `_change` to distinguish CAFE5-inferred gene-family changes from observed gene counts. Positive values represent expansions, negative values represent contractions, and zero indicates no inferred change along the corresponding branch.
+
+```{r cafe-changes}
+
+cafe_changes <- cafe_changes %>%
+  rename(
+    Orthogroup = FamilyID
+  )
+
+# Clean CAFE5 terminal and internal branch labels
+names(cafe_changes) <- clean_cafe_names(
+  names(cafe_changes)
+)
+
+# Remove unnamed columns
+cafe_changes <- cafe_changes[
+  ,
+  !(is.na(names(cafe_changes)) |
+      names(cafe_changes) == "")
+]
+
+# Rename terminal species columns
+cafe_changes <- cafe_changes %>%
+  rename_with(
+    ~ paste0(.x, "_change"),
+    .cols = any_of(all_species)
+  )
+
+# Rename internal node columns
+cafe_changes <- cafe_changes %>%
+  rename_with(
+    ~ paste0(.x, "_change"),
+    .cols = matches("^Node_[0-9]+$")
+  )
+```
+
+## 5.2 CAFE5 Family-Level Results
+The CAFE5 family-level results provide the overall statistical test for whether each gene family shows evidence of rapid evolution across the phylogeny.
+
+```{r cafe-family-results}
+
+cafe_family_results <- cafe_family_results %>%
+  rename(
+    Orthogroup = `#FamilyID`,
+    family_pvalue = pvalue,
+    family_significant = `Significant at 0.05`
+  )
+```
+
+## 5.3 CAFE5 Branch Probabilities
+The branch-probability table is standardized using the same procedure applied to the gene-family change table. Terminal species columns are given the suffix `_branch_probability` to distinguish these values from gene-family changes and observed gene counts.
+The cleaned gene-family change and branch-probability tables are then joined by orthogroup to create a single CAFE5 results table for downstream analyses.
+
+```{r cafe-branch-probabilities}
+
+cafe_branch_probabilities <- cafe_branch_probabilities %>%
+  rename(
+    Orthogroup = FamilyID
+  )
+
+# Clean CAFE5 terminal and internal branch labels
+names(cafe_branch_probabilities) <- clean_cafe_names(
+  names(cafe_branch_probabilities)
+)
+
+# Remove unnamed columns
+cafe_branch_probabilities <- cafe_branch_probabilities[
+  ,
+  !(is.na(names(cafe_branch_probabilities)) |
+      names(cafe_branch_probabilities) == "")
+]
+
+# Rename terminal species columns
+cafe_branch_probabilities <- cafe_branch_probabilities %>%
+  rename_with(
+    ~ paste0(.x, "_branch_probability"),
+    .cols = any_of(all_species)
+  )
+
+# Rename internal node columns
+cafe_branch_probabilities <- cafe_branch_probabilities %>%
+  rename_with(
+    ~ paste0(.x, "_branch_probability"),
+    .cols = matches("^Node_[0-9]+$")
+  )
+```
+
+## 5.4 Combine CAFE5 Results
+
+The three CAFE5 outputs are combined by orthogroup while retaining family-level statistics, inferred branch changes, and branch-specific probabilities as separate variables.
+
+```{r combine-cafe-results}
+
+cafe_results <- cafe_changes %>%
+  left_join(
+    cafe_family_results,
+    by = "Orthogroup"
+  ) %>%
+  left_join(
+    cafe_branch_probabilities,
+    by = "Orthogroup"
+  )
+```
+
+## 5.5 GO Annotations
+GO annotations are standardized so that each row represents a unique orthogroup–GO term association. Rows containing multiple GO terms separated by commas or semicolons are expanded into individual associations, and whitespace and missing annotations are removed.
+
+Because the same GO term may be associated with an orthogroup multiple times through different proteins, duplicated orthogroup–GO associations are identified and removed. This prevents a single orthogroup from contributing more than once to the same GO term during downstream functional analyses.
+
+A second representation of the GO annotations is generated by collapsing all unique GO terms associated with each orthogroup into a single row. The expanded representation is retained for GO enrichment analyses, while the collapsed representation can be joined to gene-family tables for inspection and classification.
+
+```{r clean-go-annotations}
+
+go_annotations_split <- go_annotations_raw %>%
+  separate_rows(
+    GO_ID,
+    sep = "[;,]"
+  ) %>%
+  mutate(
+    GO_ID = str_trim(GO_ID)
+  ) %>%
+  filter(
+    !is.na(Orthogroup),
+    Orthogroup != "",
+    !is.na(GO_ID),
+    GO_ID != ""
+  )
+
+duplicate_go_pairs <- go_annotations_split %>%
+  count(
+    Orthogroup,
+    GO_ID,
+    name = "annotation_occurrences"
+  ) %>%
+  filter(
+    annotation_occurrences > 1
+  )
+
+go_annotations <- go_annotations_split %>%
+  distinct(
+    Orthogroup,
+    GO_ID
+  )
+
+go_collapsed <- go_annotations %>%
+  arrange(
+    Orthogroup,
+    GO_ID
+  ) %>%
+  group_by(
+    Orthogroup
+  ) %>%
+  summarise(
+    GO = paste(
+      GO_ID,
+      collapse = ","
+    ),
+    .groups = "drop"
+  )
+```
+# 6. Family-Level CAFE5 Significance
+
+CAFE5 provides a family-level statistical test identifying gene families that show evidence of rapid evolution across the phylogeny. This test evaluates the gene family as a whole and does not identify which particular lineage is responsible for the significant pattern.
+
+Gene families with a family-level P-value below 0.05 are classified as significant. These results are examined independently of the branch-specific probabilities. 
+
+```{r}
+# Classify families using the CAFE5 family-level test
+family_level_summary <- cafe_results %>%
+  mutate(
+    family_level_class = case_when(
+      family_pvalue < family_pvalue_threshold ~ "Significant",
+      TRUE ~ "Not significant"
+    )
+  ) %>%
+  count(
+    family_level_class,
+    name = "n_families"
+  ) %>%
+  mutate(
+    proportion = n_families / sum(n_families)
+  )
+
+family_level_summary
+
+significant_families <- cafe_results %>%
+  filter(
+    family_pvalue < family_pvalue_threshold
+  )
+```
+# 7. Branch-Specific CAFE5 Results for *Asimina triloba*
+
+Branch-specific CAFE5 results are examined separately to evaluate gene-family changes associated specifically with the *Asimina triloba* lineage.
+
+For each orthogroup, `Asimina_triloba_change` describes the inferred direction and magnitude of gene-family change along the *A. triloba* branch. Positive values represent expansions, negative values represent contractions, and zero represents no inferred change.
+
+The corresponding `Asimina_triloba_branch_probability` provides the branch-specific probability reported by CAFE5. Because branch probabilities are available only for the subset of families represented in the CAFE5 branch-probability output, missing values are retained as missing rather than interpreted as nonsignificant probabilities.
+
+Family-level P-values and branch-specific probabilities are therefore evaluated separately.
+```{r}
+# ============================================================
+# 7. BRANCH-SPECIFIC CAFE5 RESULTS FOR ASIMINA TRILOBA
+# ============================================================
+
+# Classify all gene families by the direction of change
+# along the Asimina triloba branch.
+pawpaw_changes <- cafe_results %>%
+  mutate(
+    pawpaw_change_class = case_when(
+      Asimina_triloba_change > 0 ~ "Expanded",
+      Asimina_triloba_change < 0 ~ "Contracted",
+      Asimina_triloba_change == 0 ~ "No change",
+      TRUE ~ NA_character_
+    )
+  )
+
+
+# ------------------------------------------------------------
+# 7.1 Summarize inferred gene-family changes
+# ------------------------------------------------------------
+
+pawpaw_changes %>%
+  count(
+    pawpaw_change_class,
+    name = "n_families"
+  )
+
+
+# ------------------------------------------------------------
+# 7.2 Classify branch-specific probabilities
+# ------------------------------------------------------------
+
+# Retain families for which CAFE5 reports an
+# Asimina triloba branch probability and classify them
+# using the branch-specific significance threshold.
+pawpaw_branch_results <- pawpaw_changes %>%
+  filter(
+    !is.na(Asimina_triloba_branch_probability)
+  ) %>%
+  mutate(
+    pawpaw_branch_class = case_when(
+      Asimina_triloba_branch_probability <
+        branch_probability_threshold ~ "Below 0.05",
+      TRUE ~ "At or above 0.05"
+    )
+  )
+
+
+# Summarize branch-probability classifications
+pawpaw_branch_results %>%
+  count(
+    pawpaw_branch_class,
+    name = "n_families"
+  )
+
+
+# ------------------------------------------------------------
+# 7.3 Compare branch probability with direction of change
+# ------------------------------------------------------------
+
+pawpaw_branch_results %>%
+  count(
+    pawpaw_change_class,
+    pawpaw_branch_class,
+    name = "n_families"
+  ) %>%
+  arrange(
+    pawpaw_change_class,
+    pawpaw_branch_class
+  )
+```
+# 8. Compare Family-Level and *Asimina triloba* Branch-Specific Results
+
+Family-level and branch-specific CAFE5 results are compared to distinguish gene families showing evidence of rapid evolution across the phylogeny from those with evidence associated specifically with the *Asimina triloba* lineage.
+
+The family-level P-value identifies gene families showing significant evolutionary rate variation somewhere across the phylogeny but does not identify the lineage responsible for that signal. In contrast, the *A. triloba* branch probability provides branch-specific information for families represented in the CAFE5 branch-probability output.
+
+These statistics are therefore retained as separate measures. Their overlap is examined together with the direction of inferred gene-family change in *A. triloba* to determine which significant families are expanded, contracted, or unchanged on the pawpaw branch.
+##8.1 Compare family-level to branch specific results for A triloba 
+```{r}
+# Add family-level and branch-specific classifications to the
+# pawpaw change table.
+#
+# These statistics answer different questions:
+#   - family-level P-value: evidence of rapid evolution
+#     somewhere across the phylogeny
+#   - branch probability: evidence associated specifically
+#     with the Asimina triloba branch
+
+cafe_classified <- pawpaw_changes %>%
+  mutate(
+    
+    # Family-level significance
+    family_level_class = case_when(
+      family_pvalue < family_pvalue_threshold ~ "Significant",
+      TRUE ~ "Not significant"
+    ),
+    
+    # Asimina triloba branch-specific classification
+    pawpaw_branch_class = case_when(
+      is.na(Asimina_triloba_branch_probability) ~ "Not reported",
+      
+      Asimina_triloba_branch_probability <
+        branch_probability_threshold ~ "Below 0.05",
+      
+      TRUE ~ "At or above 0.05"
+    )
+  )
+
+cafe_classified %>%
+  count(
+    family_level_class,
+    pawpaw_change_class,
+    pawpaw_branch_class,
+    name = "n_families"
+  ) %>%
+  arrange(
+    family_level_class,
+    pawpaw_change_class,
+    pawpaw_branch_class
+  )
+```
+##8.2 Overlap of branch specific and overall significance for all spp. 
+```{r}
+    
+
+branch_overall_summary <- purrr::map_dfr(
+  all_species,
+  function(species) {
+
+    change_col <- paste0(species, "_change")
+    branch_prob_col <- paste0(
+      species,
+      "_branch_probability"
+    )
+
+    cafe_results %>%
+      summarise(
+        Species = species,
+
+        # Branch-significant expanded families
+        Branch_significant_expanded = sum(
+          .data[[change_col]] > 0 &
+            !is.na(.data[[branch_prob_col]]) &
+            .data[[branch_prob_col]] <
+              branch_probability_threshold,
+          na.rm = TRUE
+        ),
+
+        # Of those, also significant in overall CAFE5 test
+        Also_overall_significant_expanded = sum(
+          .data[[change_col]] > 0 &
+            !is.na(.data[[branch_prob_col]]) &
+            .data[[branch_prob_col]] <
+              branch_probability_threshold &
+            family_pvalue <
+              family_pvalue_threshold,
+          na.rm = TRUE
+        ),
+
+        # Branch-significant contracted families
+        Branch_significant_contracted = sum(
+          .data[[change_col]] < 0 &
+            !is.na(.data[[branch_prob_col]]) &
+            .data[[branch_prob_col]] <
+              branch_probability_threshold,
+          na.rm = TRUE
+        ),
+
+        # Of those, also significant in overall CAFE5 test
+        Also_overall_significant_contracted = sum(
+          .data[[change_col]] < 0 &
+            !is.na(.data[[branch_prob_col]]) &
+            .data[[branch_prob_col]] <
+              branch_probability_threshold &
+            family_pvalue <
+              family_pvalue_threshold,
+          na.rm = TRUE
+        )
+      )
+  }
+)
+
+branch_overall_summary
+```
+# 9. Functional Analysis of Rapidly Changing *Asimina triloba* Gene Families
+
+Filtering to see the rapidly evolving gene families as from 8.1 and categorize them with their GO functions. 
+
+### 9.1 Identify rapdily changing pawpaw families 
+```{r}
+# Identify rapidly changing gene families on the
+# Asimina triloba branch.
+rapid_pawpaw_families <- cafe_classified %>%
+  filter(
+    pawpaw_branch_class == "Below 0.05",
+    pawpaw_change_class %in% c(
+      "Expanded",
+      "Contracted"
+    )
+  )
+
+# Summarize rapidly changing families
+rapid_pawpaw_families %>%
+  count(
+    pawpaw_change_class,
+    name = "n_families"
+  )
+
+cat(
+  "Total rapidly changing A. triloba gene families:",
+  nrow(rapid_pawpaw_families),
+  "\n"
+)
+```
+
+### 9.2 Add GO annotations 
+```{r}
+rapid_pawpaw_go <- rapid_pawpaw_families %>%
+  select(
+    Orthogroup,
+    pawpaw_change_class,
+    Asimina_triloba_change,
+    Asimina_triloba_branch_probability,
+    family_pvalue
+  ) %>%
+  left_join(
+    go_annotations,
+    by = "Orthogroup"
+  )
+
+rapid_go_coverage <- rapid_pawpaw_go %>%
+  group_by(Orthogroup) %>%
+  summarise(
+    has_GO = any(!is.na(GO_ID)),
+    .groups = "drop"
+  )
+
+cat(
+  "Rapidly changing gene families:",
+  n_distinct(rapid_pawpaw_go$Orthogroup),
+  "\n",
+  "Gene families with GO terms:",
+  sum(rapid_go_coverage$has_GO),
+  "\n",
+  "Gene families without GO terms:",
+  sum(!rapid_go_coverage$has_GO),
+  "\n"
+)
+
+rapid_pawpaw_go_summary <- rapid_pawpaw_go %>%
+  filter(!is.na(GO_ID)) %>%
+  distinct(
+    Orthogroup,
+    pawpaw_change_class,
+    GO_ID
+  ) %>%
+  group_by(GO_ID) %>%
+  summarise(
+    n_families = n_distinct(Orthogroup),
+    n_expanded = n_distinct(
+      Orthogroup[pawpaw_change_class == "Expanded"]
+    ),
+    n_contracted = n_distinct(
+      Orthogroup[pawpaw_change_class == "Contracted"]
+    ),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    GO_term = unname(Term(GOTERM[GO_ID])),
+    Ontology = unname(Ontology(GOTERM[GO_ID]))
+  ) %>%
+  select(
+    GO_ID,
+    GO_term,
+    Ontology,
+    n_families,
+    n_expanded,
+    n_contracted
+  )
+```
+### 9.3 Identify GO terms potentially relevant to cold tolerance
+```{r}
+cold_keywords <- c(
+  "cold",
+  "freez",
+  "temperature",
+  "chilling",
+  "acclimation",
+  "stress",
+  "osmotic",
+  "water",
+  "dehydrat",
+  "abscisic",
+  "oxidative",
+  "reactive oxygen",
+  "carbohydrate",
+  "sugar",
+  "lipid",
+  "membrane",
+  "dormancy"
+)
+
+cold_candidate_go <- rapid_pawpaw_go_summary %>%
+  filter(
+    str_detect(
+      str_to_lower(GO_term),
+      str_c(cold_keywords, collapse = "|")
+    )
+  ) %>%
+  mutate(
+    Change = case_when(
+      n_expanded > 0 & n_contracted > 0 ~ "Both",
+      n_expanded > 0 ~ "Expanded",
+      n_contracted > 0 ~ "Contracted",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  arrange(
+    Ontology,
+    GO_term
+  )
+cold_candidate_go %>%
+  select(
+    GO_ID,
+    GO_term,
+    Ontology,
+    Change,
+    n_families,
+    n_expanded,
+    n_contracted
+  ) %>%
+  print(
+    n = Inf,
+    width = Inf
+  )
+
+write_tsv(
+  cold_candidate_go %>%
+    select(
+      GO_ID,
+      GO_term,
+      Ontology,
+      n_families,
+      n_expanded,
+      n_contracted
+    ),
+  file.path(
+    results_dir,
+    "pawpaw_cold_candidate_GO_terms.tsv"
+  )
+)
+```
+
+### 9.4 Identify cold related candidate gene families 
+```{r}
+cold_candidate_families <- rapid_pawpaw_go %>%
+  filter(
+    GO_ID %in% cold_candidate_go$GO_ID
+  ) %>%
+  left_join(
+    rapid_pawpaw_go_summary %>%
+      select(
+        GO_ID,
+        GO_term,
+        Ontology
+      ),
+    by = "GO_ID"
+  ) %>%
+  select(
+    Orthogroup,
+    pawpaw_change_class,
+    Asimina_triloba_change,
+    Asimina_triloba_branch_probability,
+    family_pvalue,
+    GO_ID,
+    GO_term,
+    Ontology
+  ) %>%
+  distinct()
+cold_candidate_summary <- cold_candidate_families %>%
+  group_by(
+    Orthogroup,
+    pawpaw_change_class,
+    Asimina_triloba_change,
+    Asimina_triloba_branch_probability,
+    family_pvalue
+  ) %>%
+  summarise(
+    GO_IDs = paste(
+      sort(unique(GO_ID)),
+      collapse = "; "
+    ),
+    GO_terms = paste(
+      sort(unique(GO_term)),
+      collapse = "; "
+    ),
+    .groups = "drop"
+  ) %>%
+  arrange(
+    Asimina_triloba_branch_probability,
+    family_pvalue,
+    desc(abs(Asimina_triloba_change))
+  )
+write_tsv(
+  cold_candidate_summary,
+  file.path(
+    results_dir,
+    "pawpaw_cold_candidate_gene_families.tsv"
+  )
+)
+
+```
+
+# 10. Identify *Asimina triloba* Genes in Cold-Related Candidate Orthogroups
+
+*Asimina triloba* genes belonging to the cold-related candidate orthogroups are identified for further functional characterization.
+
+```{r}
+# Extract Asimina triloba genes from candidate orthogroups
+pawpaw_candidate_genes <- orthogroups %>%
+  filter(
+    Orthogroup %in% cold_candidate_summary$Orthogroup
+  ) %>%
+  select(
+    Orthogroup,
+    Asimina_triloba
+  ) %>%
+  separate_rows(
+    Asimina_triloba,
+    sep = ", "
+  ) %>%
+  filter(
+    !is.na(Asimina_triloba),
+    Asimina_triloba != ""
+  ) %>%
+  rename(
+    Gene_ID = Asimina_triloba
+  ) %>%
+  left_join(
+    cold_candidate_summary,
+    by = "Orthogroup"
+  )
+```
+###10.1 Summarize candidate genes
+```{r}
+cat(
+  "Total candidate orthogroups:",
+  n_distinct(cold_candidate_summary$Orthogroup),
+  "\n",
+  "Candidate orthogroups with Asimina triloba genes:",
+  n_distinct(pawpaw_candidate_genes$Orthogroup),
+  "\n",
+  "Candidate orthogroups without Asimina triloba genes:",
+  n_distinct(cold_candidate_summary$Orthogroup) -
+    n_distinct(pawpaw_candidate_genes$Orthogroup),
+  "\n",
+  "Asimina triloba candidate genes:",
+  n_distinct(pawpaw_candidate_genes$Gene_ID),
+  "\n"
+)
+
+# Summarize candidate genes by direction of family change
+pawpaw_candidate_genes %>%
+  distinct(
+    Gene_ID,
+    pawpaw_change_class
+  ) %>%
+  count(
+    pawpaw_change_class,
+    name = "n_genes"
+  )
+```
+# 11. Functional Annotation of Candidate *Asimina triloba* Genes
+
+Functional annotations for *Asimina triloba* genes within candidate orthogroups are examined to characterize the proteins represented by rapidly expanded and contracted gene families.
+
+## 11.1 Read candidate Interproscan results: 
+```{r}
+# Identify candidate orthogroups containing Asimina triloba genes
+candidate_ogs_with_pawpaw <- unique(
+  pawpaw_candidate_genes$Orthogroup
+)
+
+# Construct paths to their InterProScan files
+candidate_interpro_files <- file.path(
+  "interproscan_output",
+  paste0(
+    candidate_ogs_with_pawpaw,
+    ".tsv"
+  )
+)
+
+cat(
+  "Candidate InterProScan files expected:",
+  length(candidate_interpro_files),
+  "\n",
+  "Candidate InterProScan files found:",
+  sum(file.exists(candidate_interpro_files)),
+  "\n"
+)
+```
+##11.2 Read Interproscan annnotations for candidate orthogroups 
+```{r}
+# Standard InterProScan TSV column names
+interpro_columns <- c(
+  "Gene_ID",
+  "MD5",
+  "Protein_length",
+  "Analysis",
+  "Signature_accession",
+  "Signature_description",
+  "Start",
+  "Stop",
+  "Score",
+  "Status",
+  "Date",
+  "InterPro_accession",
+  "InterPro_description",
+  "GO_annotations",
+  "Pathway_annotations"
+)
+
+
+# Read candidate InterProScan files
+candidate_interpro <- purrr::map_dfr(
+  candidate_interpro_files,
+  function(file) {
+    
+    read_tsv(
+      file,
+      col_names = interpro_columns,
+      show_col_types = FALSE
+    ) %>%
+      mutate(
+        Orthogroup = tools::file_path_sans_ext(
+          basename(file)
+        )
+      )
+  }
+)
+
+
+# Retain only Asimina triloba candidate genes
+pawpaw_candidate_interpro <- candidate_interpro %>%
+  filter(
+    Gene_ID %in% pawpaw_candidate_genes$Gene_ID
+  ) %>%
+  left_join(
+    pawpaw_candidate_genes %>%
+      select(
+        Orthogroup,
+        Gene_ID,
+        pawpaw_change_class,
+        Asimina_triloba_change,
+        Asimina_triloba_branch_probability,
+        family_pvalue
+      ) %>%
+      distinct(),
+    by = c(
+      "Orthogroup",
+      "Gene_ID"
+    )
+  )
+
+cat(
+  "InterProScan annotation rows:",
+  nrow(pawpaw_candidate_interpro),
+  "\n",
+  "Candidate orthogroups represented:",
+  n_distinct(pawpaw_candidate_interpro$Orthogroup),
+  "\n",
+  "Asimina triloba genes represented:",
+  n_distinct(pawpaw_candidate_interpro$Gene_ID),
+  "\n"
+)
+```
+## 11.3 Identify candidate genes without interproscan annotations: 
+```{r}
+# Identify candidate pawpaw genes without InterProScan annotations
+missing_interpro_genes <- pawpaw_candidate_genes %>%
+  anti_join(
+    pawpaw_candidate_interpro %>%
+      distinct(
+        Orthogroup,
+        Gene_ID
+      ),
+    by = c(
+      "Orthogroup",
+      "Gene_ID"
+    )
+  )
+
+cat(
+  "Candidate genes without InterProScan annotations:",
+  n_distinct(missing_interpro_genes$Gene_ID),
+  "\n",
+  "Orthogroups containing these genes:",
+  n_distinct(missing_interpro_genes$Orthogroup),
+  "\n"
+)
+```
+## 11.4 Nake gene level annotation table: 
+```{r}
+## 11.4 Create gene-level annotation table
+
+# Collapse InterProScan annotations to one row per pawpaw gene.
+pawpaw_interpro_summary <- pawpaw_candidate_interpro %>%
+  group_by(
+    Orthogroup,
+    Gene_ID
+  ) %>%
+  summarise(
+    
+    Pfam = paste(
+      sort(unique(
+        Signature_description[
+          Analysis == "Pfam" &
+            !is.na(Signature_description) &
+            Signature_description != "-"
+        ]
+      )),
+      collapse = "; "
+    ),
+    
+    PANTHER = paste(
+      sort(unique(
+        Signature_description[
+          Analysis == "PANTHER" &
+            !is.na(Signature_description) &
+            Signature_description != "-"
+        ]
+      )),
+      collapse = "; "
+    ),
+    
+    InterPro = paste(
+      sort(unique(
+        InterPro_description[
+          !is.na(InterPro_description) &
+            InterPro_description != "-"
+        ]
+      )),
+      collapse = "; "
+    ),
+    
+    .groups = "drop"
+  )
+
+
+# Add functional annotations while retaining all
+# candidate Asimina triloba genes.
+pawpaw_candidate_gene_annotations <- pawpaw_candidate_genes %>%
+  left_join(
+    pawpaw_interpro_summary,
+    by = c(
+      "Orthogroup", "Gene_ID"
+    )
+  )
+
+pawpaw_candidate_gene_annotations 
+# Save gene-level functional annotations
+write_tsv(
+  pawpaw_candidate_gene_annotations,
+  file.path(
+    results_dir,
+    "pawpaw_cold_candidate_gene_annotations.tsv"
+  )
+)
+```
+# 12. Summarize functional annotations of candidate genes
+
+## 12.1 Create gene_family level functional summary 
+```{r}
+candidate_family_functions <- pawpaw_candidate_gene_annotations %>%
+  group_by(
+    Orthogroup,
+    pawpaw_change_class,
+    Asimina_triloba_change,
+    Asimina_triloba_branch_probability,
+    family_pvalue,
+    GO_terms
+  ) %>%
+  summarise(
+    
+    n_pawpaw_genes = n_distinct(Gene_ID),
+    
+    Gene_IDs = paste(
+      sort(unique(Gene_ID)),
+      collapse = "; "
+    ),
+    
+    Pfam = paste(
+      sort(unique(na.omit(Pfam[Pfam != ""]))),
+      collapse = "; "
+    ),
+    
+    PANTHER = paste(
+      sort(unique(na.omit(PANTHER[PANTHER != ""]))),
+      collapse = "; "
+    ),
+    
+    InterPro = paste(
+      sort(unique(na.omit(InterPro[InterPro != ""]))),
+      collapse = "; "
+    ),
+    
+    .groups = "drop"
+  ) %>%
+  arrange(
+    Asimina_triloba_branch_probability,
+    family_pvalue,
+    desc(abs(Asimina_triloba_change))
+  )
+
+```
+##12.2 Explore TE related candidates 
+```{r}
+
+candidate_family_functions <- candidate_family_functions %>%
+  mutate(
+    
+    annotation_text = paste(
+      Pfam,
+      PANTHER,
+      InterPro,
+      sep = "; "
+    ),
+    
+    TE_associated = str_detect(
+      annotation_text,
+      regex(
+        "transpos|retrotrans|retroelement|reverse transcript|retroviral|integrase|gag",
+        ignore_case = TRUE
+      )
+    )
+  )
+
+
+# Summarize TE-associated candidate families
+candidate_family_functions %>%
+  count(
+    TE_associated,
+    pawpaw_change_class,
+    name = "n_families"
+  ) %>%
+  print()
+
+candidate_family_functions %>%
+  filter(TE_associated) %>%
+  select(
+    Orthogroup,
+    pawpaw_change_class,
+    Asimina_triloba_change,
+    Asimina_triloba_branch_probability,
+    family_pvalue,
+    n_pawpaw_genes,
+    Pfam,
+    PANTHER,
+    InterPro,
+    GO_terms
+  ) %>%
+  arrange(
+    Asimina_triloba_branch_probability
+  ) %>%
+  print(
+    n = Inf,
+    width = Inf
+  )
+```
+##12.3 Remove TE associated from candidate set 
+```{r}
+candidate_family_functions_filtered <- candidate_family_functions %>%
+  filter(!TE_associated)
+
+cat(
+  "Candidate families before TE filtering:",
+  nrow(candidate_family_functions), "\n",
+  "TE-associated families removed:",
+  sum(candidate_family_functions$TE_associated), "\n",
+  "Candidate families retained:",
+  nrow(candidate_family_functions_filtered), "\n"
+)
+
+candidate_family_functions_filtered %>%
+  count(
+    pawpaw_change_class,
+    name = "n_families"
+  ) %>%
+  print()
+
+write_tsv(
+  candidate_family_functions %>%
+    filter(TE_associated),
+  file.path(
+    results_dir,
+    "pawpaw_TE_associated_candidate_families_excluded.tsv"
+  )
+)
+
+write_tsv(
+  candidate_family_functions_filtered,
+  file.path(
+    results_dir,
+    "pawpaw_cold_candidate_family_functions_TE_filtered.tsv"
+  )
+)
+```
+
+##12.4  Identify strongest non-TE candidate gene families
+```{r}
+top10_candidate_families <- candidate_family_functions_filtered %>%
+  arrange(
+    Asimina_triloba_branch_probability,
+    family_pvalue,
+    desc(abs(Asimina_triloba_change))
+  ) %>%
+  slice_head(n = 10) %>%
+  select(
+    Orthogroup,
+    pawpaw_change_class,
+    Asimina_triloba_change,
+    Asimina_triloba_branch_probability,
+    family_pvalue,
+    n_pawpaw_genes,
+    Gene_IDs,
+    GO_terms,
+    Pfam,
+    PANTHER,
+    InterPro
+  )
+
+
+top10_candidate_families %>%
+  print(
+    n = 10,
+    width = Inf
+  )
+
+write_tsv(
+  top10_candidate_families,
+  file.path(
+    results_dir,
+    "pawpaw_top10_cold_candidate_gene_families_TE_filtered.tsv"
+  )
+)
+```
+##12.5 Create final top 10 table 
+```{r}
+top10_candidate_table <- top10_candidate_families %>%
+  transmute(
+    Orthogroup,
+    Change = pawpaw_change_class,
+    Family_size_change = Asimina_triloba_change,
+    Branch_probability = Asimina_triloba_branch_probability,
+    Family_pvalue = family_pvalue,
+    Pawpaw_genes = n_pawpaw_genes,
+    GO_terms,
+    Pfam,
+    PANTHER,
+    InterPro
+  )
+
+top10_candidate_table %>%
+  print(
+    n = 10,
+    width = Inf
+  )
+
+write_tsv(
+  top10_candidate_table,
+  file.path(
+    results_dir,
+    "pawpaw_top10_cold_candidate_table.tsv"
+  )
+)
+```
+##12.4 Summarize functions by candidate group 
+```{r}
+candidate_family_functions <- pawpaw_candidate_gene_annotations %>%
+  group_by(
+    Orthogroup,
+    pawpaw_change_class,
+    Asimina_triloba_change,
+    Asimina_triloba_branch_probability,
+    GO_terms
+  ) %>%
+  summarise(
+    n_pawpaw_genes = n_distinct(Gene_ID),
+
+    Pfam = paste(
+      sort(unique(na.omit(Pfam[Pfam != ""]))),
+      collapse = "; "
+    ),
+
+    PANTHER = paste(
+      sort(unique(na.omit(PANTHER[PANTHER != ""]))),
+      collapse = "; "
+    ),
+
+    InterPro = paste(
+      sort(unique(na.omit(InterPro[InterPro != ""]))),
+      collapse = "; "
+    ),
+
+    .groups = "drop"
+  ) %>%
+  arrange(
+    pawpaw_change_class,
+    Asimina_triloba_branch_probability,
+    desc(abs(Asimina_triloba_change))
+  )
+
+candidate_family_functions %>%
+  select(
+    Orthogroup,
+    pawpaw_change_class,
+    Asimina_triloba_change,
+    Asimina_triloba_branch_probability,
+    GO_terms,
+    n_pawpaw_genes,
+    PANTHER,
+    InterPro
+  ) %>%
+  print(n = Inf, width = Inf)
+```
+##12.6 Assign concise functional descriptions to the top 10 candidates 
+```{r}
+# ============================================================
+# 12.6 Assign concise functional descriptions to Top 10 candidates
+# ============================================================
+
+top10_candidate_table <- top10_candidate_table %>%
+  mutate(
+    Functional_annotation = case_when(
+      
+      Orthogroup == "OG0000008" ~
+        "Leucine-rich repeat/receptor-like kinase proteins",
+      
+      Orthogroup == "OG0000023" ~
+        "Leucine-rich repeat receptor-like kinases",
+      
+      Orthogroup == "OG0000036" ~
+        "Disease-resistance/leucine-rich repeat proteins",
+      
+      Orthogroup == "OG0000039" ~
+        "GRF-type zinc finger proteins",
+      
+      Orthogroup == "OG0000189" ~
+        "Uncharacterized",
+      
+      Orthogroup == "OG0000153" ~
+        "ABC transporter proteins",
+      
+      Orthogroup == "OG0000200" ~
+        "NB-ARC/leucine-rich repeat disease-resistance proteins",
+      
+      Orthogroup == "OG0011777" ~
+        "Cytochrome P450 proteins",
+      
+      Orthogroup == "OG0000067" ~
+        "Sugar transporters",
+      
+      Orthogroup == "OG0000235" ~
+        "Glycoside hydrolase family 17 proteins",
+      
+      TRUE ~ NA_character_
+    )
+  )
+
+top10_candidate_table_final <- top10_candidate_table %>%
+  select(
+    Orthogroup,
+    Change,
+    Family_size_change,
+    Branch_probability,
+    Family_pvalue,
+    Pawpaw_genes,
+    Functional_annotation,
+    GO_terms
+  )
+
+top10_candidate_table_final %>%
+  print(
+    n = 10,
+    width = Inf
+  )
+
+# Save detailed Top 10 table
+write_tsv(
+  top10_candidate_table,
+  file.path(
+    results_dir,
+    "pawpaw_top10_cold_candidates_detailed.tsv"
+  )
+)
+
+# Save publication-ready Top 10 table
+write_tsv(
+  top10_candidate_table_final,
+  file.path(
+    results_dir,
+    "pawpaw_top10_cold_candidates_table.tsv"
+  )
+)
+```
+functional_theme_by_change
