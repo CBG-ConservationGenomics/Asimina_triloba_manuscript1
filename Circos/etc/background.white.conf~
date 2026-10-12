@@ -1,0 +1,6 @@
+# background.white.conf – white image background for Circos
+
+# Set the global image background color to white
+background = white
+# or, explicitly:
+# background = 255,255,255

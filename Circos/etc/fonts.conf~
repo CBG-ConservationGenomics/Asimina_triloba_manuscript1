@@ -1,0 +1,21 @@
+z# fonts.conf – simple system font setup
+
+# Sans-serif family (used by 'default')
+# Update the paths to valid TTF files on your system
+
+# Linux example (DejaVu)
+default      = /Users/srs57/Library/Fonts/dejavu/DejaVuSans.ttf
+sans         = /Users/srs57/Library/Fonts/DejaVuSans.ttf
+sans_serif   = /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf
+bold         = /usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf
+italic       = /usr/share/fonts/truetype/dejavu/DejaVuSans-Oblique.ttf
+bolditalic   = /usr/share/fonts/truetype/dejavu/DejaVuSans-BoldOblique.ttf
+
+# Serif family (optional; use if you want 'serif' labels)
+serif        = /usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf
+serif_bold   = /usr/share/fonts/truetype/dejavu/DejaVuSerif-Bold.ttf
+serif_italic = /usr/share/fonts/truetype/dejavu/DejaVuSerif-Italic.ttf
+
+# Monospace (for text tracks where alignment matters)
+mono         = /usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf
+fixed        = /usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf
