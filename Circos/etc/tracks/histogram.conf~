@@ -1,0 +1,56 @@
+# histogram.conf – generic histogram track definitions
+
+# Histogram tracks from 4-column BED: chr start end value
+<plots>
+
+  # Repeat density histogram (outer track)
+  <plot>
+    type  = histogram
+    file  = data/Atri_repeats_100kb.bed
+
+    # Radial position
+    r1    = 0.90r
+    r0    = 0.70r
+
+    # Value range – set to your data range
+    min   = 0
+    max   = 100000
+
+    # Appearance
+    color       = repeats      # defined in colors.conf
+    fill_under  = yes
+    fill_color  = repeats
+    thickness   = 1p
+    orientation = out
+    extend_bin  = no
+
+    # Optional axes/grid
+    <<include etc/tracks/axis.conf>>
+  </plot>
+
+  # Gene density histogram (inner track)
+  <plot>
+    type  = histogram
+    file  = data/Asimina_triloba_gene_100kb.hist
+
+    # Radial position – inside the repeat track
+    r1    = 0.68r
+    r0    = 0.50r
+
+    # Data range – set to your observed max count
+    min   = 0
+    max   = 100000    # adjust after inspecting Asimina_triloba_gene_100kb.hist
+
+    # Appearance
+    color       = genes        # defined in colors.conf
+    fill_under  = yes
+    fill_color  = genes
+    thickness   = 1p
+    orientation = out
+    extend_bin  = no
+
+    # Optional axes for this track
+    <<include etc/tracks/axis.conf>>
+  </plot>
+
+</plots>
